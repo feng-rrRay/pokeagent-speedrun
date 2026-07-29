@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Thin MCP proxy for the Pokemon Emerald game server.
+Thin MCP proxy for the Pokemon game server (Emerald or Red).
 
 Every @mcp.tool() function forwards its arguments as an HTTP request to the
 corresponding /mcp/* endpoint on the game server (server/app.py).  No game
@@ -50,7 +50,20 @@ SERVER_URL = os.environ.get("POKEMON_SERVER_URL", "http://localhost:8000")
 _MCP_PORT = int(os.environ.get("MCP_PORT", "8002"))
 _MCP_HOST = os.environ.get("MCP_HOST", "0.0.0.0")  # Bind to all interfaces for Docker access
 
-mcp = FastMCP(name="pokemon-emerald", host=_MCP_HOST, port=_MCP_PORT)
+# Game-neutral server name: the same proxy serves Pokemon Emerald (GBA) and
+# Pokemon Red (GBC). Must stay in sync with HERMES_MCP_SERVER_KEY in
+# cli_agent_backends.py (Hermes derives tool names mcp_{key}_* from it).
+mcp = FastMCP(name="pokemon", host=_MCP_HOST, port=_MCP_PORT)
+
+# Game-specific tool schema text. GAME_TYPE is inherited from run_cli.py,
+# which sets it before spawning this process.
+_GAME_TYPE = os.environ.get("GAME_TYPE", "emerald").lower()
+if _GAME_TYPE == "red":
+    _CONSOLE_NAME = "Game Boy (GBC)"
+    _VALID_BUTTONS = "A, B, START, SELECT, UP, DOWN, LEFT, RIGHT, WAIT"
+else:
+    _CONSOLE_NAME = "Game Boy Advance"
+    _VALID_BUTTONS = "A, B, START, SELECT, UP, DOWN, LEFT, RIGHT, L, R, WAIT"
 
 _TIMEOUT_SHORT = 10   # seconds — lightweight reads
 _TIMEOUT_MEDIUM = 30  # seconds — actions/pathfinding
@@ -101,30 +114,21 @@ def get_game_state():
     return result
 
 
-@mcp.tool()
-def press_buttons(
-    buttons: List[str],
-    speed: str = "normal",
-    hold_frames: Optional[int] = None,
-    release_frames: Optional[int] = None,
-    reasoning: str = "",
-    source: str = "",
-    metadata: Optional[Dict[str, Any]] = None,
-) -> dict:
-    """
-    Press buttons on the Game Boy Advance emulator with optional speed control.
+@mcp.tool(
+    description=f"""
+    Press buttons on the {_CONSOLE_NAME} emulator with optional speed control.
     Buttons are executed sequentially. You control action timing for optimal gameplay.
 
     Args:
         buttons: List of buttons to press in sequence (e.g., ['A', 'A', 'B'])
-                 Available buttons: A, B, START, SELECT, UP, DOWN, LEFT, RIGHT, L, R, WAIT
+                 Available buttons: {_VALID_BUTTONS}
         speed: Action speed preset - "fast" (dialogue/menus, 9 frames), "normal" (movement, 18 frames),
                or "slow" (careful inputs, 32 frames). Default is "normal".
         hold_frames: Optional explicit hold duration in frames (overrides speed preset)
         release_frames: Optional explicit release duration in frames (overrides speed preset)
         reasoning: Brief explanation of why you're pressing these buttons
         source: Optional label identifying where this action originated (e.g., 'navigate_to')
-        metadata: Optional dictionary of metadata to attach to the action (e.g., {'variance': 'high'})
+        metadata: Optional dictionary of metadata to attach to the action (e.g., {{'variance': 'high'}})
 
     Speed Guide:
         - "fast": Use for dialogue advancement, menu spam, rapid button presses (9 frames = ~0.09s at 100 FPS)
@@ -139,6 +143,17 @@ def press_buttons(
     Returns:
         Dictionary with success status, buttons pressed, and updated game state
     """
+)
+def press_buttons(
+    buttons: List[str],
+    speed: str = "normal",
+    hold_frames: Optional[int] = None,
+    release_frames: Optional[int] = None,
+    reasoning: str = "",
+    source: str = "",
+    metadata: Optional[Dict[str, Any]] = None,
+) -> dict:
+    """Press buttons on the emulator (schema text is set game-conditionally above)."""
     body: Dict[str, Any] = {"buttons": buttons, "reasoning": reasoning}
     if speed:
         body["speed"] = speed
@@ -376,7 +391,7 @@ def _run_combined_transport() -> None:
 if __name__ == "__main__":
     logger.info("Pokemon MCP Server starting (thin proxy mode)...")
     logger.info(f"Proxying to game server at: {SERVER_URL}")
-    logger.info("Server name: pokemon-emerald")
+    logger.info("Server name: pokemon (game: %s)", _GAME_TYPE)
     logger.info("Available tools (2 total, CLI agent minimal set):")
     logger.info("  Game: get_game_state, press_buttons")
     logger.info("")

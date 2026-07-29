@@ -150,3 +150,16 @@ class TestHermesSessionReader:
         assert _normalize_tool_calls(raw) == [
             {"name": "get_game_state", "args": {}},
         ]
+
+    def test_normalize_tool_calls_handles_game_neutral_prefix(self):
+        """New game-neutral server key 'pokemon' produces mcp_pokemon_* tool names."""
+        raw = [
+            {
+                "type": "function",
+                "function": {"name": "mcp_pokemon_press_buttons", "arguments": "{}"},
+            }
+        ]
+
+        assert _normalize_tool_calls(raw) == [
+            {"name": "press_buttons", "args": {}},
+        ]

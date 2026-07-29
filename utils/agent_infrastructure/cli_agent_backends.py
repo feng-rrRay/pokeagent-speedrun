@@ -210,10 +210,12 @@ class CliAgentBackend(ABC):
 
     def _build_bootstrap_content(self, directive_path: str, server_url: str) -> str:
         """Build bootstrap prompt string from directive file and server URL."""
+        from agents.prompts.paths import render_prompt
+
         directive_content = ""
         if directive_path and os.path.exists(directive_path):
             with open(directive_path, "r") as f:
-                directive_content = f.read()
+                directive_content = render_prompt(f.read())
         if directive_content:
             return (
                 f"{directive_content}\n\n"
@@ -224,7 +226,7 @@ class CliAgentBackend(ABC):
                 "- Poll game state on your own via MCP tools; do not wait for additional operator prompts.\n"
                 "- Continue until externally terminated by the orchestrator when completion condition is met.\n"
             )
-        return "Start the Pokemon Emerald agent session."
+        return render_prompt("Start the {game_name} agent session.")
 
     def _post_thinking(
         self,
@@ -1652,6 +1654,21 @@ env_key = "OPENROUTER_API_KEY"
             return False
 
 
+# Hermes MCP server key. Hermes derives tool names (mcp_{key}_*) and the
+# toolset name (mcp-{key}) from this config key, so it must stay in sync with
+# enabled_toolsets and the prefix normalization in hermes_wrapper.py.
+# Game-neutral: the same server proxies Pokemon Emerald and Pokemon Red.
+HERMES_MCP_SERVER_KEY = "pokemon"
+
+# Old-name prefixes kept for normalizing artifacts from pre-rename sessions.
+HERMES_MCP_TOOL_PREFIXES = (
+    "mcp_pokemon_emerald_",
+    "mcp__pokemon-emerald__",
+    "mcp_pokemon_",
+    "mcp__pokemon__",
+)
+
+
 class HermesCliBackend(CliAgentBackend):
     """Backend for the Nous Hermes agent, bridged through a local JSONL wrapper."""
 
@@ -1695,7 +1712,7 @@ class HermesCliBackend(CliAgentBackend):
 
     @staticmethod
     def _normalize_tool_name(name: str) -> str:
-        for prefix in ("mcp_pokemon_emerald_", "mcp__pokemon-emerald__"):
+        for prefix in HERMES_MCP_TOOL_PREFIXES:
             if name.startswith(prefix):
                 return name[len(prefix) :]
         return name.split("__")[-1] if "__" in name else name
@@ -1733,7 +1750,7 @@ class HermesCliBackend(CliAgentBackend):
         if mcp_url:
             body = (
                 "mcp_servers:\n"
-                "  pokemon-emerald:\n"
+                f"  {HERMES_MCP_SERVER_KEY}:\n"
                 f'    url: "{mcp_url}"\n'
                 "    tools:\n"
                 "      prompts: false\n"
@@ -1743,7 +1760,7 @@ class HermesCliBackend(CliAgentBackend):
             executable = Path(sys.executable).resolve().as_posix()
             body = (
                 "mcp_servers:\n"
-                "  pokemon-emerald:\n"
+                f"  {HERMES_MCP_SERVER_KEY}:\n"
                 f'    command: "{executable}"\n'
                 '    args: ["-m", "server.cli.pokemon_mcp_server"]\n'
                 "    env:\n"
@@ -1932,6 +1949,7 @@ class HermesCliBackend(CliAgentBackend):
             ]
 
             passthrough_envs = [
+                "GAME_TYPE",
                 "OPENROUTER_API_KEY",
                 "OPENAI_API_KEY",
                 "ANTHROPIC_API_KEY",

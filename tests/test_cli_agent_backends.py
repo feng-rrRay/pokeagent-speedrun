@@ -421,6 +421,16 @@ class TestHermesCliBackendStreamEvent:
         )
         assert metrics.tool_use_count == 1
 
+    def test_normalize_tool_name_handles_old_and_new_prefixes(self):
+        assert HermesCliBackend._normalize_tool_name("mcp_pokemon_press_buttons") == "press_buttons"
+        assert HermesCliBackend._normalize_tool_name("mcp_pokemon_emerald_press_buttons") == "press_buttons"
+
+    def test_hermes_mcp_config_uses_game_neutral_key(self, tmp_path):
+        backend = HermesCliBackend()
+        block = backend._build_hermes_mcp_block(mcp_url="http://host.docker.internal:8002/mcp")
+        assert "  pokemon:\n" in block
+        assert "pokemon-emerald" not in block
+
     def test_tool_use_posts_short_name_without_reasoning(self):
         backend = HermesCliBackend()
         posted = []

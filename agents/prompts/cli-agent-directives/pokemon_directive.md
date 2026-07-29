@@ -36,15 +36,15 @@ Retrieve the current game state including player position, party Pokemon, map, i
 
 **Use this to:** Observe your surroundings, check your position, see your Pokemon's health, review items. 
 
-**Important**: For Localization and mapping, bias towards the content you can visually see in the image, not the Porymap data as the decompilation data does not necessarily represent the exact state of the game at that current instance. NPC and object locations listed here may be for later or earlier stages in the game.
+**Important**: For localization and mapping, bias towards the content you can visually see in the image, not the decompilation-derived map data, as it does not necessarily represent the exact state of the game at that current instance. NPC and object locations listed here may be for later or earlier stages in the game.
 
 ---
 
 #### `press_buttons(buttons, speed, hold_frames, release_frames, reasoning, source, metadata)`
-Press buttons on the Game Boy Advance emulator.
+Press buttons on the emulator.
 
 **Parameters:**
-- `buttons`: List of buttons to press in sequence. Valid buttons: A, B, START, SELECT, UP, DOWN, LEFT, RIGHT, L, R, WAIT
+- `buttons`: List of buttons to press in sequence. The valid button list is in the tool's schema description; it depends on the game ({game_name} in this run). Pokemon Emerald (GBA) additionally has L and R shoulder buttons; Pokemon Red (Game Boy) does not.
 - `speed`: Action speed preset (default: "normal")
   - "fast": For dialogue/menus (9 frames)
   - "normal": For movement (18 frames)

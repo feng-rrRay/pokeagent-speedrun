@@ -20,11 +20,17 @@ GAME_NAME = GAME_NAMES.get(game_type, "Pokemon Emerald")
 def render_prompt(content: str) -> str:
     """Substitute {game_name} in prompt content based on GAME_TYPE env var.
 
+    Reads GAME_TYPE at call time (falling back to the import-time value) so
+    callers that set the env var after this module was imported — e.g.
+    run_cli.py, which imports paths before parsing --game — still render the
+    correct game.
+
     Uses plain str.replace() instead of str.format_map() so that literal
     curly braces in prompt files (JSON examples, code blocks) don't cause
     ValueError.
     """
-    game_name = GAME_NAMES.get(game_type, "Pokemon Emerald")
+    game_type_now = os.environ.get("GAME_TYPE", game_type).lower()
+    game_name = GAME_NAMES.get(game_type_now, "Pokemon Emerald")
     return content.replace("{game_name}", game_name)
 
 

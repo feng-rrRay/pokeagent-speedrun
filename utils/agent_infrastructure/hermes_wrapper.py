@@ -41,6 +41,30 @@ def _read_text(path: str | None) -> str:
         return ""
 
 
+# MCP server key — must match HERMES_MCP_SERVER_KEY in cli_agent_backends.py
+# (which writes the mcp_servers block into the Hermes config). Hermes derives
+# tool names (mcp_{key}_*) and the toolset name (mcp-{key}) from that key.
+# This wrapper cannot import the backend module: Hermes's top-level utils.py
+# shadows the repo's utils package on the container PYTHONPATH.
+_MCP_SERVER_KEY = "pokemon"
+_MCP_TOOL_PREFIX = f"mcp_{_MCP_SERVER_KEY}_"
+# Old-name prefixes first (longest match) for pre-rename session artifacts.
+_MCP_TOOL_PREFIXES = (
+    "mcp_pokemon_emerald_",
+    "mcp__pokemon-emerald__",
+    "mcp_pokemon_",
+    "mcp__pokemon__",
+)
+
+
+def _game_name() -> str:
+    """Human-readable game name from GAME_TYPE (passed into the container)."""
+    game_type = os.environ.get("GAME_TYPE", "emerald").lower()
+    return {"red": "Pokemon Red", "emerald": "Pokemon Emerald"}.get(
+        game_type, "Pokemon Emerald"
+    )
+
+
 def _build_initial_prompt(
     directive_text: str,
     server_url: str,
@@ -57,14 +81,14 @@ def _build_initial_prompt(
     )
     if is_resume:
         return (
-            "Continue the current autonomous Pokemon Emerald session.\n\n"
+            f"Continue the current autonomous {_game_name()} session.\n\n"
             f"{runtime_context}"
         )
     if directive_text.strip():
         # directive_text from backend already includes directive + runtime context; use as-is
         return directive_text.rstrip()
     return (
-        "Start the autonomous Pokemon Emerald session.\n\n"
+        f"Start the autonomous {_game_name()} session.\n\n"
         f"{runtime_context}"
     )
 
@@ -78,7 +102,7 @@ def _extract_tool_reasoning(arguments: dict[str, Any]) -> str:
 
 
 def _normalize_tool_name(name: str) -> str:
-    for prefix in ("mcp_pokemon_emerald_", "mcp__pokemon-emerald__"):
+    for prefix in _MCP_TOOL_PREFIXES:
         if name.startswith(prefix):
             return name[len(prefix) :]
     return name.split("__")[-1] if "__" in name else name
@@ -448,15 +472,14 @@ def main() -> int:
             registered_name = function.get("name")
             if not isinstance(registered_name, str):
                 continue
-            prefix = "mcp_pokemon_emerald_"
-            if not registered_name.startswith(prefix):
+            if not registered_name.startswith(_MCP_TOOL_PREFIX):
                 continue
             entry = registry._tools.get(registered_name)
             if entry is None:
                 continue
-            raw_tool_name = registered_name[len(prefix) :]
+            raw_tool_name = registered_name[len(_MCP_TOOL_PREFIX) :]
             entry.handler = _build_multimodal_registry_handler(
-                "pokemon-emerald",
+                _MCP_SERVER_KEY,
                 raw_tool_name,
                 120.0,
             )
@@ -724,7 +747,7 @@ def main() -> int:
             quiet_mode=True,
             session_id=resume_session_id,
             session_db=session_db,
-            enabled_toolsets=["mcp-pokemon-emerald"],
+            enabled_toolsets=[f"mcp-{_MCP_SERVER_KEY}"],
             tool_progress_callback=tool_progress_callback,
             reasoning_callback=reasoning_callback,
             pass_session_id=True,
@@ -736,7 +759,7 @@ def main() -> int:
                 "type": "system",
                 "session_id": agent.session_id,
                 "model": agent.model,
-                "mcp_servers": ["pokemon-emerald"],
+                "mcp_servers": [_MCP_SERVER_KEY],
                 "tools": [tool.get("function", {}).get("name", "") for tool in (agent.tools or [])],
             }
         )

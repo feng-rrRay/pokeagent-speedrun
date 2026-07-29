@@ -39,7 +39,14 @@ def _parse_timestamp(ts: Any) -> datetime | None:
 def _normalize_tool_name(name: Any) -> str | None:
     if not isinstance(name, str) or not name:
         return None
-    for prefix in ("mcp_pokemon_emerald_", "mcp__pokemon-emerald__"):
+    # Old-name prefixes first (longest match) for pre-rename session artifacts;
+    # keep in sync with HERMES_MCP_TOOL_PREFIXES in cli_agent_backends.py.
+    for prefix in (
+        "mcp_pokemon_emerald_",
+        "mcp__pokemon-emerald__",
+        "mcp_pokemon_",
+        "mcp__pokemon__",
+    ):
         if name.startswith(prefix):
             return name[len(prefix) :]
     return name.split("__")[-1] if "__" in name else name
