@@ -108,6 +108,77 @@ def _normalize_tool_name(name: str) -> str:
     return name.split("__")[-1] if "__" in name else name
 
 
+_MAX_RESTORED_CHARS = int(os.environ.get("HERMES_MAX_RESTORED_CHARS", "200000") or 0)
+
+# Hermes treats an assistant message carrying no tool call as "the agent is
+# finished" (run_agent.py, the `No tool calls - this is the final response`
+# branch). With only a think block to show it retries three times and then ends
+# the session, which costs a full container relaunch. This trailing user turn
+# pushes the model to keep acting instead of ending the turn.
+_CONTINUATION_NUDGE = (
+    "The session is still active and you are the one playing. "
+    "Do not end your turn here - decide the next step from the result "
+    "above and carry it out now. If the situation is unclear, gather "
+    "more information rather than stopping."
+)
+
+
+def _message_chars(message: Any) -> int:
+    if not isinstance(message, dict):
+        return 0
+    total = len(str(message.get("content") or ""))
+    for call in message.get("tool_calls") or []:
+        function = call.get("function") if isinstance(call, dict) else None
+        if isinstance(function, dict):
+            total += len(str(function.get("arguments") or ""))
+    return total
+
+
+def _cap_restored_history(
+    messages: list[dict[str, Any]] | None,
+    max_chars: int = _MAX_RESTORED_CHARS,
+) -> list[dict[str, Any]] | None:
+    """Bound a resumed conversation so the first API call fits in context.
+
+    Hermes only compresses after a successful tool-calling turn, so a session
+    restored above the model's usable context can never compress its way out:
+    the first call returns think-blocks-only, the session aborts, and the next
+    launch restores the same oversized history. Trimming keeps the tail within
+    a character budget.
+
+    The cut lands on a user message so a tool result is never separated from
+    the assistant tool_call it answers, which providers reject.
+    """
+    if not messages or max_chars <= 0:
+        return messages
+
+    head = [m for m in messages[:8] if isinstance(m, dict) and m.get("role") == "system"]
+
+    budget = max_chars
+    start = len(messages)
+    for index in range(len(messages) - 1, -1, -1):
+        budget -= _message_chars(messages[index])
+        if budget < 0:
+            break
+        start = index
+    if start == 0:
+        return messages
+
+    boundaries = [
+        i
+        for i, m in enumerate(messages)
+        if isinstance(m, dict) and m.get("role") == "user"
+    ]
+    cut = next((i for i in boundaries if i >= start), None)
+    if cut is None:
+        cut = boundaries[-1] if boundaries else start
+        # No later boundary: fall back to dropping orphaned leading tool results.
+        while cut < len(messages) - 1 and messages[cut].get("role") == "tool":
+            cut += 1
+
+    return head + messages[cut:]
+
+
 def _append_jsonl(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
@@ -291,6 +362,21 @@ def main() -> int:
         for message in (conversation_history or [])
         if isinstance(message, dict) and message.get("role") == "assistant"
     )
+    # Counted above from the FULL history so assistant_index (and the usage
+    # event IDs derived from it) stay monotonic across the trim.
+    _restored_before = len(conversation_history or [])
+    conversation_history = _cap_restored_history(conversation_history)
+    _restored_after = len(conversation_history or [])
+    if _restored_after != _restored_before:
+        _emit(
+            {
+                "type": "system",
+                "subtype": "history_capped",
+                "restored_messages": _restored_after,
+                "original_messages": _restored_before,
+                "max_chars": _MAX_RESTORED_CHARS,
+            }
+        )
 
     model = args.model.strip() or os.environ.get("HERMES_MODEL", "").strip() or "google/gemini-3-flash-preview"
     provider = args.provider.strip() or os.environ.get("HERMES_PROVIDER", "").strip() or None
@@ -500,9 +586,9 @@ def main() -> int:
                     # retries at full prompt cost, then tears the session down.
                     # An explicit continuation instruction keeps the turn going.
                     payload["next"] = (
-                        "Action executed. Continue autonomously: verify the outcome "
-                        "with get_game_state and issue your next action. Respond with "
-                        "a tool call or a brief plan - never an empty message."
+                        "Action executed. Continue autonomously: check the outcome "
+                        "and take your next step. Never end your turn with an "
+                        "empty message."
                     )
                 if image_count:
                     multimodal_counter += 1
@@ -804,6 +890,21 @@ def main() -> int:
                                 },
                                 *image_parts,
                             ],
+                        }
+                    )
+
+            # Only when the conversation ends on a tool result - the turn where
+            # the model chooses between acting and stopping. Appended last so it
+            # follows any injected screenshot and leaves the cached prefix intact.
+            # `transformed` is a local copy, so this is never persisted to the
+            # session DB and cannot accumulate across resumes.
+            if _CONTINUATION_NUDGE and api_messages:
+                last = api_messages[-1]
+                if isinstance(last, dict) and last.get("role") == "tool":
+                    transformed.append(
+                        {
+                            "role": "user",
+                            "content": [{"type": "text", "text": _CONTINUATION_NUDGE}],
                         }
                     )
 

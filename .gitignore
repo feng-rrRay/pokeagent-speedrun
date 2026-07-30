@@ -160,6 +160,7 @@ out_2.txt
 run.sh
 run_cli.sh
 llm_logs/*
+ace/
 
 # Agent backups
 backups/
