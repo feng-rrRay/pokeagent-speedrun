@@ -493,6 +493,17 @@ def main() -> int:
                 # #endregion
 
                 payload: dict[str, Any] = {"result": "\n".join(text_parts) if text_parts else ""}
+                if tool_name == "press_buttons":
+                    # Gemini ends its turn with a genuinely empty message after an
+                    # action result (nothing new to observe, nothing to answer).
+                    # Hermes treats empty responses as failed generations and
+                    # retries at full prompt cost, then tears the session down.
+                    # An explicit continuation instruction keeps the turn going.
+                    payload["next"] = (
+                        "Action executed. Continue autonomously: verify the outcome "
+                        "with get_game_state and issue your next action. Respond with "
+                        "a tool call or a brief plan - never an empty message."
+                    )
                 if image_count:
                     multimodal_counter += 1
                     ref = f"{server_name}:{tool_name}:{multimodal_counter}"
