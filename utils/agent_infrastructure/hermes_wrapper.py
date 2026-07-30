@@ -174,9 +174,30 @@ def _extract_usage_snapshot(response: Any) -> dict[str, Any]:
         usage_map = response_map["usage"]
 
     prompt_details = _coerce_mapping(usage_map.get("prompt_tokens_details"))
+    completion_details = _coerce_mapping(usage_map.get("completion_tokens_details"))
     prompt_tokens = int(usage_map.get("prompt_tokens", 0) or usage_map.get("input_tokens", 0) or 0)
-    completion_tokens = int(usage_map.get("completion_tokens", 0) or usage_map.get("output_tokens", 0) or 0)
-    total_tokens = int(usage_map.get("total_tokens", 0) or (prompt_tokens + completion_tokens))
+    reported_completion_tokens = int(
+        usage_map.get("completion_tokens", 0)
+        or usage_map.get("output_tokens", 0)
+        or 0
+    )
+    total_tokens = int(
+        usage_map.get("total_tokens", 0)
+        or (prompt_tokens + reported_completion_tokens)
+    )
+    # Match the paper-run backends: Gemini includes hidden thinking output in
+    # total_tokens but may omit it from completion_tokens.
+    completion_tokens = max(
+        reported_completion_tokens,
+        max(0, total_tokens - prompt_tokens),
+    )
+    total_tokens = max(total_tokens, prompt_tokens + completion_tokens)
+    reasoning_tokens = int(
+        completion_details.get("reasoning_tokens", 0)
+        or usage_map.get("thoughts_token_count", 0)
+        or usage_map.get("thoughts_tokens", 0)
+        or 0
+    )
     cached_tokens = int(prompt_details.get("cached_tokens", 0) or usage_map.get("cache_read_input_tokens", 0) or 0)
     cache_write_tokens = int(prompt_details.get("cache_write_tokens", 0) or usage_map.get("cache_creation_input_tokens", 0) or 0)
     total_cost_usd = float(
@@ -189,6 +210,9 @@ def _extract_usage_snapshot(response: Any) -> dict[str, Any]:
     return {
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
+        "reported_completion_tokens": reported_completion_tokens,
+        "completion_adjustment_tokens": completion_tokens - reported_completion_tokens,
+        "reasoning_tokens": reasoning_tokens,
         "total_tokens": total_tokens,
         "cached_tokens": cached_tokens,
         "cache_write_tokens": cache_write_tokens,
@@ -262,6 +286,11 @@ def main() -> int:
             conversation_history = session_db.get_messages_as_conversation(resume_session_id)
         except Exception:
             conversation_history = None
+    existing_assistant_count = sum(
+        1
+        for message in (conversation_history or [])
+        if isinstance(message, dict) and message.get("role") == "assistant"
+    )
 
     model = args.model.strip() or os.environ.get("HERMES_MODEL", "").strip() or "google/gemini-3-flash-preview"
     provider = args.provider.strip() or os.environ.get("HERMES_PROVIDER", "").strip() or None
@@ -275,7 +304,9 @@ def main() -> int:
     start_time = time.time()
     usage_state = {
         "last_snapshot": None,
-        "api_call_index": 0,
+        "assistant_index": existing_assistant_count,
+        "session_api_calls": 0,
+        "captured_calls": 0,
         "prompt_tokens": 0,
         "completion_tokens": 0,
         "total_tokens": 0,
@@ -286,9 +317,14 @@ def main() -> int:
     multimodal_store: dict[str, dict[str, Any]] = {}
     multimodal_counter = 0
 
-    def _capture_usage_snapshot(snapshot: dict[str, Any], session_id: str, model_name: str) -> None:
-        api_call_index = usage_state["api_call_index"]  # index of the call we're capturing
-        usage_state["api_call_index"] += 1  # advance for next call
+    def _capture_usage_snapshot(
+        snapshot: dict[str, Any],
+        session_id: str,
+        model_name: str,
+        assistant_index: int,
+        tool_calls: Any,
+    ) -> None:
+        usage_state["captured_calls"] += 1
         usage_state["prompt_tokens"] += int(snapshot.get("prompt_tokens", 0) or 0)
         usage_state["completion_tokens"] += int(snapshot.get("completion_tokens", 0) or 0)
         usage_state["total_tokens"] += int(snapshot.get("total_tokens", 0) or 0)
@@ -300,15 +336,60 @@ def main() -> int:
             {
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "session_id": session_id,
-                "api_call_index": api_call_index,
+                "event_id": f"{session_id}:assistant:{assistant_index}",
+                "assistant_index": assistant_index,
+                # Kept for compatibility with older readers and artifacts.
+                "api_call_index": assistant_index,
+                "session_call_index": int(snapshot.get("session_call_index", 0) or 0),
                 "model": model_name,
                 "prompt_tokens": int(snapshot.get("prompt_tokens", 0) or 0),
                 "completion_tokens": int(snapshot.get("completion_tokens", 0) or 0),
+                "reported_completion_tokens": int(
+                    snapshot.get("reported_completion_tokens", 0) or 0
+                ),
+                "completion_adjustment_tokens": int(
+                    snapshot.get("completion_adjustment_tokens", 0) or 0
+                ),
+                "reasoning_tokens": int(snapshot.get("reasoning_tokens", 0) or 0),
                 "total_tokens": int(snapshot.get("total_tokens", 0) or 0),
                 "cached_tokens": int(snapshot.get("cached_tokens", 0) or 0),
                 "cache_write_tokens": int(snapshot.get("cache_write_tokens", 0) or 0),
                 "total_cost_usd": float(snapshot.get("total_cost_usd", 0.0) or 0.0),
+                "tool_calls": tool_calls if isinstance(tool_calls, list) else [],
             },
+        )
+
+    def _flush_pending_usage(agent: Any) -> None:
+        """Persist usage from response paths that bypass assistant-message construction."""
+        snapshot = usage_state.pop("last_snapshot", None)
+        if snapshot is None:
+            return
+
+        assistant_messages: list[dict[str, Any]] = []
+        try:
+            persisted_messages = session_db.get_messages_as_conversation(agent.session_id)
+            assistant_messages = [
+                message
+                for message in (persisted_messages or [])
+                if isinstance(message, dict) and message.get("role") == "assistant"
+            ]
+        except Exception:
+            pass
+
+        assistant_index = max(
+            usage_state["assistant_index"] + 1,
+            len(assistant_messages),
+        )
+        usage_state["assistant_index"] = assistant_index
+        tool_calls: Any = []
+        if assistant_index <= len(assistant_messages):
+            tool_calls = assistant_messages[assistant_index - 1].get("tool_calls", [])
+        _capture_usage_snapshot(
+            snapshot,
+            agent.session_id,
+            agent.model,
+            assistant_index,
+            tool_calls,
         )
 
     def _patch_mcp_image_bridge() -> None:
@@ -548,8 +629,8 @@ def main() -> int:
 
                 def _wrapped(*call_args, **call_kwargs):
                     _api_start = time.time()
-                    _api_idx = usage_state.get("api_call_index", 0) + 1
-                    usage_state["api_call_index"] = _api_idx
+                    usage_state["session_api_calls"] += 1
+                    _api_idx = usage_state["session_api_calls"]
                     msgs = call_kwargs.get("messages") or (call_args[0] if call_args else None)
                     msg_count = len(msgs) if isinstance(msgs, (list, tuple)) else 0
                     image_count, payload_bytes = _count_images(msgs)
@@ -610,6 +691,7 @@ def main() -> int:
                         for key, value in snapshot.items()
                         if not key.startswith("_")
                     }
+                    usage_state["last_snapshot"]["session_call_index"] = _api_idx
                     return response
 
                 return _wrapped
@@ -631,9 +713,17 @@ def main() -> int:
 
         def _patched_build_assistant_message(self, assistant_message, finish_reason: str):
             message = original_build_assistant_message(self, assistant_message, finish_reason)
+            usage_state["assistant_index"] += 1
             snapshot = usage_state.pop("last_snapshot", None)
             if snapshot is not None:
-                _capture_usage_snapshot(snapshot, self.session_id, self.model)
+                tool_calls = message.get("tool_calls", []) if isinstance(message, dict) else []
+                _capture_usage_snapshot(
+                    snapshot,
+                    self.session_id,
+                    self.model,
+                    usage_state["assistant_index"],
+                    tool_calls,
+                )
             return message
 
         def _patched_build_api_kwargs(self, api_messages: list[dict[str, Any]]) -> dict:
@@ -775,6 +865,7 @@ def main() -> int:
             conversation_history=conversation_history,
             persist_user_message=user_message,
         )
+        _flush_pending_usage(agent)
         duration_ms = int((time.time() - start_time) * 1000)
 
         _emit(
@@ -783,7 +874,7 @@ def main() -> int:
                 "session_id": agent.session_id,
                 "model": agent.model,
                 "content": result.get("final_response") if isinstance(result, dict) else None,
-                "num_turns": int(usage_state["api_call_index"] or getattr(agent, "session_api_calls", 0) or 0),
+                "num_turns": int(usage_state["captured_calls"] or getattr(agent, "session_api_calls", 0) or 0),
                 "duration_ms": duration_ms,
                 "duration_api_ms": 0,
                 "total_cost_usd": float(usage_state["total_cost_usd"] or 0.0),

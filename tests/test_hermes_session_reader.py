@@ -135,6 +135,111 @@ class TestHermesSessionReader:
         assert second_hashes == hashes
         assert second_state == state
 
+    def test_usage_events_are_canonical_and_keep_resume_duplicates(self, tmp_path):
+        _write_session_log(
+            tmp_path,
+            {
+                "session_id": "hermes-session-1",
+                "model": "gemini-3.1-pro-preview",
+                "messages": [
+                    {"role": "assistant", "tool_calls": []},
+                    {"role": "assistant", "tool_calls": []},
+                ],
+            },
+        )
+        _write_usage_events(
+            tmp_path,
+            {
+                "timestamp": "2026-03-15T20:02:48+00:00",
+                "session_id": "hermes-session-1",
+                "api_call_index": 1,
+                "prompt_tokens": 100,
+                "completion_tokens": 10,
+                "total_tokens": 110,
+            },
+            {
+                "timestamp": "2026-03-15T20:03:48+00:00",
+                "session_id": "hermes-session-1",
+                "api_call_index": 1,
+                "prompt_tokens": 200,
+                "completion_tokens": 20,
+                "total_tokens": 220,
+            },
+        )
+
+        entries, hashes, _ = load_new_usage_entries(tmp_path, set(), {})
+
+        assert len(entries) == 2
+        assert len(hashes) == 2
+        assert [entry["_tokens"]["total"] for entry in entries] == [110, 220]
+
+    def test_usage_event_supplies_stable_id_and_tool_calls(self, tmp_path):
+        _write_session_log(
+            tmp_path,
+            {
+                "session_id": "hermes-session-1",
+                "messages": [{"role": "assistant", "tool_calls": []}],
+            },
+        )
+        _write_usage_events(
+            tmp_path,
+            {
+                "event_id": "hermes-session-1:assistant:7",
+                "assistant_index": 7,
+                "timestamp": "2026-03-15T20:02:48+00:00",
+                "session_id": "hermes-session-1",
+                "model": "gemini-3.1-pro-preview",
+                "prompt_tokens": 300,
+                "completion_tokens": 30,
+                "total_tokens": 330,
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "mcp_pokemon_press_buttons",
+                            "arguments": '{"buttons": ["A"]}',
+                        },
+                    }
+                ],
+            },
+        )
+
+        entries, hashes, _ = load_new_usage_entries(tmp_path, set(), {})
+
+        assert hashes == {"hermes-session-1:assistant:7"}
+        assert entries[0]["_event_id"] == "hermes-session-1:assistant:7"
+        assert entries[0]["_model"] == "gemini-3.1-pro-preview"
+        assert entries[0]["_tool_calls"] == [
+            {"name": "press_buttons", "args": {"buttons": ["A"]}},
+        ]
+
+    def test_normalizes_hidden_completion_tokens_like_paper_runs(self, tmp_path):
+        _write_session_log(
+            tmp_path,
+            {
+                "session_id": "hermes-session-1",
+                "messages": [{"role": "assistant", "tool_calls": []}],
+            },
+        )
+        _write_usage_events(
+            tmp_path,
+            {
+                "event_id": "hermes-session-1:assistant:1",
+                "assistant_index": 1,
+                "timestamp": "2026-03-15T20:02:48+00:00",
+                "session_id": "hermes-session-1",
+                "prompt_tokens": 100,
+                "completion_tokens": 10,
+                "total_tokens": 135,
+            },
+        )
+
+        entries, _, _ = load_new_usage_entries(tmp_path, set(), {})
+
+        assert entries[0]["_tokens"]["prompt"] == 100
+        assert entries[0]["_tokens"]["completion"] == 35
+        assert entries[0]["_tokens"]["total"] == 135
+
     def test_normalize_tool_calls_reads_nested_function_shape(self):
         raw = [
             {

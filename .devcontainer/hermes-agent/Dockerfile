@@ -31,6 +31,10 @@ RUN git clone https://github.com/NousResearch/hermes-agent.git /opt/hermes-agent
     pip install --no-cache-dir ".[mcp]" && \
     pip install --no-cache-dir -e "./mini-swe-agent"
 
+# The pinned Hermes commit uses the mcp 1.x client API
+# (mcp.client.streamable_http.streamablehttp_client was removed in mcp 2.0).
+RUN pip install --no-cache-dir "mcp>=1.8,<2"
+
 COPY init-firewall.sh /usr/local/bin/init-firewall.sh
 RUN chmod +x /usr/local/bin/init-firewall.sh
 

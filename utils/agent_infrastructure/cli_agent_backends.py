@@ -169,14 +169,35 @@ class CliAgentBackend(ABC):
                 try:
                     event = json.loads(stripped)
                 except json.JSONDecodeError:
-                    if hasattr(sys, "stdout"):
-                        sys.stdout.write(line)
-                        sys.stdout.flush()
-                    continue
+                    event = self._salvage_json_event(stripped)
+                    if event is None:
+                        if hasattr(sys, "stdout"):
+                            sys.stdout.write(line)
+                            sys.stdout.flush()
+                        continue
                 self.handle_stream_event(event, metrics, server_url)
         except (OSError, ValueError) as e:
             logger.debug("stream reader error: %s", e)
         logger.debug("stream reader exiting: %s", self.name)
+
+    @staticmethod
+    def _salvage_json_event(stripped: str) -> dict | None:
+        """Recover a JSON event glued to decorative output on the same line.
+
+        Hermes renders spinner animations to stdout with bare carriage
+        returns, so a JSONL event can land on the same line as spinner
+        frames ("... (1.9s)   {\"type\": \"tool_use\", ...}"). Parse from
+        the last CR onward, falling back to the first '{"'.
+        """
+        tail = stripped.rsplit("\r", 1)[-1]
+        start = tail.find('{"')
+        if start == -1:
+            return None
+        try:
+            event = json.loads(tail[start:])
+        except json.JSONDecodeError:
+            return None
+        return event if isinstance(event, dict) else None
 
     def _build_mcp_config_sse(self, mcp_sse_port: int) -> dict:
         """Build MCP config dict for SSE (containerized) mode. type=sse is REQUIRED.
@@ -1726,7 +1747,15 @@ class HermesCliBackend(CliAgentBackend):
             print("ℹ️  Host ~/.hermes not found; Hermes will rely on environment variables/config generated for this run.")
             return
 
-        skipped_names = {"audio_cache", "hermes-agent", "image_cache", "logs", "sessions", "state.db"}
+        # .env is skipped deliberately: Hermes loads it with override=True at
+        # import time, so a seeded personal .env would clobber the run's
+        # HERMES_*/API-key environment. cron/hooks are skipped so personal
+        # cronjobs/hooks never execute inside benchmark containers.
+        skipped_names = {
+            "audio_cache", "hermes-agent", "image_cache", "logs", "sessions",
+            "state.db", "usage_events.jsonl", ".env", "cron", "hooks",
+            ".hermes_history",
+        }
         for child in host_hermes_dir.iterdir():
             if child.name in skipped_names:
                 continue
@@ -1953,6 +1982,7 @@ class HermesCliBackend(CliAgentBackend):
                 "OPENROUTER_API_KEY",
                 "OPENAI_API_KEY",
                 "ANTHROPIC_API_KEY",
+                "GEMINI_API_KEY",
                 "HERMES_MODEL",
                 "HERMES_PROVIDER",
                 "HERMES_BASE_URL",
@@ -2111,6 +2141,7 @@ class HermesCliBackend(CliAgentBackend):
                     timestamp=ts_float,
                     model_info=model_info,
                     tool_calls=tool_calls if tool_calls else None,
+                    source_event_id=entry.get("_event_id"),
                 )
             except Exception as exc:
                 logger.warning("Failed to append Hermes CLI step %d: %s", last_cli_step, exc)

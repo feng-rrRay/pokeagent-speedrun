@@ -107,13 +107,15 @@ class RunDataManager:
     def save_metadata(self, 
                      command_args: Dict[str, Any],
                      sys_argv: List[str],
-                     additional_info: Optional[Dict[str, Any]] = None):
+                     additional_info: Optional[Dict[str, Any]] = None,
+                     overwrite: bool = False):
         """Save run metadata to cumulative metrics (metadata.json deprecated)
         
         Args:
             command_args: Parsed command line arguments dictionary
             sys_argv: Original sys.argv for exact reproducibility
             additional_info: Optional additional metadata
+            overwrite: Replace metadata restored from a prior run
         """
         metadata = {
             "run_id": self.run_id,
@@ -185,7 +187,7 @@ class RunDataManager:
 
             llm_logger = get_llm_logger()
             if llm_logger:
-                llm_logger.set_run_metadata(metadata)
+                llm_logger.set_run_metadata(metadata, overwrite=overwrite)
         except Exception as e:
             logger.warning(f"Failed to write run metadata to cumulative metrics: {e}")
     
@@ -762,4 +764,3 @@ def cleanup_old_cache_runs() -> None:
     Kept for compatibility with server shutdown path; does nothing.
     """
     pass
-

@@ -9,6 +9,7 @@ import shutil
 import logging
 import zipfile
 import json
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -16,20 +17,58 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 
-def _load_metrics_summary(path: Path) -> Optional[dict]:
+def _load_metrics(path: Path) -> Optional[dict]:
     try:
         if not path.exists():
             return None
         with open(path, "r", encoding="utf-8") as f:
-            d = json.load(f)
-        return {
-            "last_update_time": d.get("last_update_time", 0),
-            "total_actions": d.get("total_actions", 0),
-            "total_tokens": d.get("total_tokens", 0),
-            "run_id": d.get("metadata", {}).get("run_id"),
-        }
-    except Exception:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except (OSError, json.JSONDecodeError):
         return None
+
+
+def _load_metrics_summary(path: Path) -> Optional[dict]:
+    d = _load_metrics(path)
+    if d is None:
+        return None
+    return {
+        "last_update_time": d.get("last_update_time", 0),
+        "total_actions": d.get("total_actions", 0),
+        "total_tokens": d.get("total_tokens", 0),
+        "run_id": d.get("metadata", {}).get("run_id"),
+    }
+
+
+def _fresh_metrics_with_context(source: dict) -> dict:
+    """Reset phase counters while retaining checkpoint milestone/objective rows."""
+    now = time.time()
+    milestones = source.get("milestones")
+    objectives = source.get("objectives")
+    milestones = milestones if isinstance(milestones, list) else []
+    objectives = objectives if isinstance(objectives, list) else []
+    return {
+        "total_tokens": 0,
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "cached_tokens": 0,
+        "cache_write_tokens": 0,
+        "total_cost": 0.0,
+        "total_actions": 0,
+        "start_time": now,
+        "total_llm_calls": 0,
+        "total_run_time": 0,
+        "last_update_time": now,
+        "metadata": {},
+        "steps": [],
+        "milestones": milestones,
+        "objectives": objectives,
+        "restored_metric_context": {
+            "milestone_count": len(milestones),
+            "objective_count": len(objectives),
+            "source_run_id": source.get("metadata", {}).get("run_id"),
+        },
+    }
 
 
 def create_cache_backup(
@@ -187,7 +226,9 @@ def _cleanup_old_backups(backup_base_dir: Path, max_run_dirs: int = 50) -> None:
 def restore_cache_from_backup(
     backup_file: str,
     cache_dir: str = None,
-    create_backup_of_current: bool = True
+    create_backup_of_current: bool = True,
+    restore_metrics: bool = True,
+    preserve_metric_context: bool = False,
 ) -> bool:
     """
     Restore .pokeagent_cache from a backup zip file.
@@ -196,6 +237,9 @@ def restore_cache_from_backup(
         backup_file: Path to the backup zip file
         cache_dir: Directory to restore to (default: run-specific cache)
         create_backup_of_current: Whether to backup current cache before restoring
+        restore_metrics: Whether to restore cumulative metrics and LLM history
+        preserve_metric_context: With fresh metrics, retain milestone/objective rows
+            from the checkpoint while resetting all phase counters and steps
 
     Returns:
         True if restore succeeded, False otherwise
@@ -212,6 +256,7 @@ def restore_cache_from_backup(
             return False
 
         cache_path = Path(cache_dir)
+        metric_artifacts = {"cumulative_metrics.json", "checkpoint_llm.txt"}
 
         # Backup current cache before restoring
         if create_backup_of_current and cache_path.exists() and any(cache_path.iterdir()):
@@ -222,6 +267,11 @@ def restore_cache_from_backup(
 
         # Create cache directory if it doesn't exist
         cache_path.mkdir(parents=True, exist_ok=True)
+        if not restore_metrics:
+            for artifact_name in metric_artifacts:
+                artifact_path = cache_path / artifact_name
+                if artifact_path.is_file():
+                    artifact_path.unlink()
 
         # Extract backup to temporary location
         import tempfile
@@ -237,9 +287,27 @@ def restore_cache_from_backup(
             
             extracted_run_dir = extracted_dirs[0]
             logger.info(f"Found extracted directory: {extracted_run_dir.name}")
+            restored_metrics = cache_path / "cumulative_metrics.json"
+            extracted_metrics = extracted_run_dir / "cumulative_metrics.json"
+            source_run_cache = cache_path.parent / extracted_run_dir.name
+            source_latest_metrics = source_run_cache / "cumulative_metrics.json"
+
+            extracted_summary = _load_metrics_summary(extracted_metrics)
+            source_summary = _load_metrics_summary(source_latest_metrics)
+            preferred_metrics = extracted_metrics
+            if (
+                extracted_summary
+                and source_summary
+                and source_summary.get("last_update_time", 0)
+                > extracted_summary.get("last_update_time", 0)
+            ):
+                preferred_metrics = source_latest_metrics
             
             # Copy all files from extracted directory to target cache directory
             for item in extracted_run_dir.iterdir():
+                if not restore_metrics and item.name in metric_artifacts:
+                    logger.debug("Skipped metric artifact for fresh restore: %s", item.name)
+                    continue
                 dest = cache_path / item.name
                 if item.is_file():
                     shutil.copy2(item, dest)
@@ -248,25 +316,32 @@ def restore_cache_from_backup(
                     shutil.copytree(item, dest, dirs_exist_ok=True)
                     logger.debug(f"Copied directory: {item.name}")
 
-            # Prefer the latest source-run cumulative metrics when available.
-            # Backups are objective-time snapshots, but resumed runs should continue from
-            # the source run's latest aggregate totals.
-            restored_metrics = cache_path / "cumulative_metrics.json"
-            source_run_cache = cache_path.parent / extracted_run_dir.name
-            source_latest_metrics = source_run_cache / "cumulative_metrics.json"
+            if restore_metrics:
+                # Backups are objective-time snapshots, but resumed runs should continue
+                # from the source run's latest aggregate totals when available.
+                restored_summary = _load_metrics_summary(restored_metrics)
 
-            restored_summary = _load_metrics_summary(restored_metrics)
-            source_summary = _load_metrics_summary(source_latest_metrics)
-
-            if (
-                restored_summary
-                and source_summary
-                and source_summary.get("last_update_time", 0) > restored_summary.get("last_update_time", 0)
-            ):
-                shutil.copy2(source_latest_metrics, restored_metrics)
+                if (
+                    restored_summary
+                    and source_summary
+                    and source_summary.get("last_update_time", 0)
+                    > restored_summary.get("last_update_time", 0)
+                ):
+                    shutil.copy2(source_latest_metrics, restored_metrics)
+                    logger.info(
+                        "Promoted latest cumulative_metrics.json from source run cache: %s",
+                        source_latest_metrics,
+                    )
+            elif preserve_metric_context:
+                source_metrics = _load_metrics(preferred_metrics) or {}
+                fresh_metrics = _fresh_metrics_with_context(source_metrics)
+                with open(restored_metrics, "w", encoding="utf-8") as f:
+                    json.dump(fresh_metrics, f, indent=2)
                 logger.info(
-                    "Promoted latest cumulative_metrics.json from source run cache: %s",
-                    source_latest_metrics,
+                    "Restored fresh metric context: %d milestone(s), %d objective(s) from %s",
+                    len(fresh_metrics["milestones"]),
+                    len(fresh_metrics["objectives"]),
+                    preferred_metrics,
                 )
 
         logger.info(f"✅ Successfully restored cache to {cache_dir}")

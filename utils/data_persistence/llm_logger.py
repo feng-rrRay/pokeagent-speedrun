@@ -353,6 +353,7 @@ class LLMLogger:
         timestamp: float,
         model_info: Optional[Dict[str, Any]] = None,
         tool_calls: Optional[list] = None,
+        source_event_id: Optional[str] = None,
     ) -> None:
         """Append one step derived from a Claude Code JSONL entry into cumulative_metrics.
 
@@ -371,6 +372,7 @@ class LLMLogger:
             timestamp:    UNIX timestamp of the JSONL entry.
             model_info:   Optional dict with at least a "model" key for pricing lookup.
             tool_calls:   Optional list of {name, args} dicts from the assistant message.
+            source_event_id: Stable backend event ID used to avoid duplicates after resume.
         """
         # NOTE: intentionally not gated by _metrics_write_enabled() here – in-memory
         # update must happen even when disk writes are off so the sync path works.
@@ -454,6 +456,8 @@ class LLMLogger:
             ]
             if cleaned:
                 step_entry["tool_calls"] = cleaned
+        if source_event_id:
+            step_entry["source_event_id"] = source_event_id
 
         self.cumulative_metrics["steps"].append(step_entry)
         # Only write to disk when this process owns the file (server in single-writer mode).
@@ -908,9 +912,22 @@ class LLMLogger:
             self.cumulative_metrics.update(saved_metrics)
             self._ensure_metrics_structure()
 
+            restored_context = self.cumulative_metrics.get("restored_metric_context")
+            if not isinstance(restored_context, dict):
+                restored_context = {}
+            milestone_context_count = min(
+                max(0, int(restored_context.get("milestone_count", 0) or 0)),
+                len(self.cumulative_metrics["milestones"]),
+            )
+            objective_context_count = min(
+                max(0, int(restored_context.get("objective_count", 0) or 0)),
+                len(self.cumulative_metrics["objectives"]),
+            )
+
             # Restore internal tracking from last milestone if available
-            if self.cumulative_metrics["milestones"]:
-                last_milestone = self.cumulative_metrics["milestones"][-1]
+            phase_milestones = self.cumulative_metrics["milestones"][milestone_context_count:]
+            if phase_milestones:
+                last_milestone = phase_milestones[-1]
                 self.cumulative_metrics["_last_milestone_step"] = last_milestone.get("cumulative_steps", 0)
                 self.cumulative_metrics["_last_milestone_tokens"] = {
                     "prompt": last_milestone.get("cumulative_prompt_tokens", 0),
@@ -922,8 +939,9 @@ class LLMLogger:
                 self.cumulative_metrics["_last_milestone_actions"] = last_milestone.get("cumulative_actions", 0)
 
             # Restore internal tracking from last objective if available
-            if self.cumulative_metrics.get("objectives"):
-                last_obj = self.cumulative_metrics["objectives"][-1]
+            phase_objectives = self.cumulative_metrics["objectives"][objective_context_count:]
+            if phase_objectives:
+                last_obj = phase_objectives[-1]
                 self.cumulative_metrics["_last_objective_step"] = last_obj.get("cumulative_steps", 0)
                 self.cumulative_metrics["_last_objective_tokens"] = {
                     "prompt": last_obj.get("cumulative_prompt_tokens", 0),
@@ -1200,4 +1218,4 @@ def log_objective_completion(
     """
     get_llm_logger().log_objective_completion(
         objective_id, category, objective_index, step_number, timestamp
-    ) 
+    )

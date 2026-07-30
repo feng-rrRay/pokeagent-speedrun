@@ -108,6 +108,8 @@ def _extract_usage_tokens(raw: dict[str, Any]) -> dict[str, Any]:
     prompt = int(raw.get("prompt_tokens", 0) or raw.get("input_tokens", 0) or 0)
     completion = int(raw.get("completion_tokens", 0) or raw.get("output_tokens", 0) or 0)
     total = int(raw.get("total_tokens", 0) or (prompt + completion))
+    completion = max(completion, max(0, total - prompt))
+    total = max(total, prompt + completion)
     prompt_details = _coerce_mapping(raw.get("prompt_tokens_details"))
     cached = int(
         raw.get("cached_tokens", 0)
@@ -132,19 +134,19 @@ def _extract_usage_tokens(raw: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _load_usage_events(data_path: Path) -> dict[str, dict[int, dict[str, Any]]]:
+def _load_usage_events(data_path: Path) -> dict[str, list[dict[str, Any]]]:
     usage_path = Path(data_path).resolve() / USAGE_EVENTS_NAME
     if not usage_path.exists():
         return {}
 
-    events_by_session: dict[str, dict[int, dict[str, Any]]] = {}
+    events_by_session: dict[str, list[dict[str, Any]]] = {}
     try:
         lines = usage_path.read_text(encoding="utf-8").splitlines()
     except OSError as exc:
         logger.warning("Could not read Hermes usage events %s: %s", usage_path, exc)
         return {}
 
-    for line in lines:
+    for line_number, line in enumerate(lines, start=1):
         line = line.strip()
         if not line:
             continue
@@ -158,15 +160,19 @@ def _load_usage_events(data_path: Path) -> dict[str, dict[int, dict[str, Any]]]:
         session_id = raw.get("session_id")
         if not isinstance(session_id, str) or not session_id:
             continue
-        api_call_index = int(raw.get("api_call_index", 0) or 0)
-        if api_call_index <= 0:
+        assistant_index = int(raw.get("assistant_index", 0) or raw.get("api_call_index", 0) or 0)
+        if assistant_index <= 0:
             continue
 
         event = {
+            "event_id": raw.get("event_id") or f"usage:{session_id}:line:{line_number}",
+            "assistant_index": assistant_index,
             "timestamp": _parse_timestamp(raw.get("timestamp")),
             "tokens": _extract_usage_tokens(raw),
+            "model": raw.get("model"),
+            "tool_calls": _normalize_tool_calls(raw.get("tool_calls")),
         }
-        events_by_session.setdefault(session_id, {})[api_call_index] = event
+        events_by_session.setdefault(session_id, []).append(event)
     return events_by_session
 
 
@@ -210,53 +216,45 @@ def load_new_usage_entries(
         if not isinstance(messages, list):
             continue
 
-        session_state = dict(next_state.get(session_id, {}))
-        last_assistant_index = int(session_state.get("assistant_index", 0) or 0)
         session_start = _parse_timestamp(payload.get("session_start")) or datetime.now(timezone.utc)
         model = payload.get("model") or "hermes-agent"
-        session_usage = usage_events.get(session_id, {})
+        session_usage = usage_events.get(session_id, [])
+        assistant_messages = [
+            message
+            for message in messages
+            if isinstance(message, dict) and message.get("role") == "assistant"
+        ]
 
-        assistant_index = 0
-        for message in messages:
-            if not isinstance(message, dict) or message.get("role") != "assistant":
+        for usage_event in session_usage:
+            event_id = usage_event["event_id"]
+            if event_id in updated_hashes:
                 continue
 
-            assistant_index += 1
-            if assistant_index <= last_assistant_index:
-                continue
-
-            tool_calls = _normalize_tool_calls(message.get("tool_calls"))
-            usage_event = session_usage.get(assistant_index, {})
-            tokens = usage_event.get(
-                "tokens",
-                {
-                    "prompt": 0,
-                    "completion": 0,
-                    "cached": 0,
-                    "cache_write": 0,
-                    "total": 0,
-                    "cost": 0.0,
-                },
+            assistant_index = usage_event["assistant_index"]
+            tool_calls = usage_event.get("tool_calls") or []
+            if not tool_calls and assistant_index <= len(assistant_messages):
+                tool_calls = _normalize_tool_calls(
+                    assistant_messages[assistant_index - 1].get("tool_calls")
+                )
+            parsed_ts = usage_event.get("timestamp") or (
+                session_start + timedelta(milliseconds=assistant_index)
             )
-            parsed_ts = usage_event.get("timestamp") or (session_start + timedelta(milliseconds=assistant_index))
-
-            snapshot_hash = f"json:{session_id}:assistant:{assistant_index}"
-            if snapshot_hash in updated_hashes:
-                continue
 
             new_entries.append(
                 {
-                    "_tokens": tokens,
+                    "_tokens": usage_event["tokens"],
                     "_tool_calls": tool_calls,
                     "_parsed_timestamp": parsed_ts,
-                    "_model": model,
+                    "_model": usage_event.get("model") or model,
                     "_session_id": session_id,
+                    "_event_id": event_id,
                 }
             )
-            updated_hashes.add(snapshot_hash)
+            updated_hashes.add(event_id)
 
         next_state[session_id] = {
-            "assistant_index": assistant_index,
+            "assistant_index": len(assistant_messages),
+            "usage_event_count": len(session_usage),
         }
 
     new_entries.sort(key=lambda e: (e.get("_parsed_timestamp") or datetime.min.replace(tzinfo=timezone.utc)))

@@ -23,7 +23,7 @@ import shutil
 import json
 import secrets
 from datetime import datetime
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 import requests
 
@@ -508,6 +508,16 @@ class Services:
     server_url: str
 
 
+@dataclass
+class CliRunState:
+    """Mutable CLI process and metric state retained across interrupts."""
+
+    cli_session: CliSession | None = None
+    cli_log_file: object | None = None
+    processed_hashes: set[str] = field(default_factory=set)
+    last_cli_step: int = -1
+
+
 LAST_CLI_SESSION_ID_FILENAME = "last_cli_session_id"
 
 
@@ -538,15 +548,24 @@ def _write_last_session_id(session_id: str) -> None:
         logger.warning("Could not persist last_session_id: %s", e)
 
 
-def _restore_from_backup(backup_path: str) -> bool:
+def _restore_from_backup(
+    backup_path: str,
+    continue_metrics: bool = False,
+) -> bool:
     """Restore cache from backup zip. Returns True if successful."""
     from utils.data_persistence.backup_manager import restore_cache_from_backup
     from utils.data_persistence.run_data_manager import get_cache_directory
 
     print(f"\n📦 Restoring from backup: {backup_path}")
+    if continue_metrics:
+        print("📊 Continuing counters, steps, and LLM history from backup")
+    else:
+        print("📊 Starting paper-comparison accounting at zero")
     success = restore_cache_from_backup(
         backup_file=backup_path,
         create_backup_of_current=False,
+        restore_metrics=continue_metrics,
+        preserve_metric_context=not continue_metrics,
     )
     if success:
         print(f"✅ Backup restored to: {get_cache_directory()}")
@@ -632,6 +651,47 @@ def _cleanup_services(
     print("👋 Goodbye!")
 
 
+def _flush_cli_metrics_before_shutdown(
+    run_state: CliRunState,
+    backend: CliAgentBackend,
+    agent_memory_dir: Path,
+    server_url: str,
+    graceful_timeout: int,
+) -> None:
+    """Stop the CLI writer, drain stdout, and sync its final durable usage events."""
+    session = run_state.cli_session
+    if session is not None and session.process.poll() is None:
+        _terminate_process(
+            process=session.process,
+            graceful_timeout=graceful_timeout,
+            label="🤖 Stopping CLI agent",
+            use_process_group=True,
+        )
+
+    if session is not None and session.stream_thread is not None:
+        session.stream_thread.join(timeout=max(5, graceful_timeout))
+        if session.stream_thread.is_alive():
+            session.stop_event.set()
+            session.stream_thread.join(timeout=2)
+
+    log_file = run_state.cli_log_file
+    if log_file is not None and not log_file.closed:
+        try:
+            log_file.flush()
+        except OSError:
+            pass
+
+    try:
+        run_state.processed_hashes, run_state.last_cli_step = backend.log_cli_interaction(
+            agent_memory_dir,
+            run_state.processed_hashes,
+            run_state.last_cli_step,
+            server_url=server_url,
+        )
+    except Exception as exc:
+        logger.warning("Final CLI metrics flush failed: %s", exc)
+
+
 def launch_cli_agent(
     backend,
     server_url: str,
@@ -708,6 +768,7 @@ def _run_agent_loop(
     run_manager,
     agent_memory_dir: Path,
     backend: CliAgentBackend,
+    run_state: CliRunState,
 ) -> tuple[str | None, CliSession | None, object]:
     """Run the agent loop until termination. Returns (termination_reason, last_cli_session, cli_log_file)."""
     from utils.data_persistence.run_data_manager import get_cache_path
@@ -762,10 +823,15 @@ def _run_agent_loop(
     consecutive_failures = 0
 
     # JSONL step tracking – persists across agent session restarts within one run
-    processed_hashes: set[str] = set()
     from utils.data_persistence.llm_logger import get_llm_logger as _get_llm_logger
     _existing_steps = _get_llm_logger().cumulative_metrics.get("steps", [])
-    last_cli_step: int = max((s["step"] for s in _existing_steps), default=-1)
+    run_state.processed_hashes = {
+        step["source_event_id"]
+        for step in _existing_steps
+        if isinstance(step, dict)
+        and isinstance(step.get("source_event_id"), str)
+    }
+    run_state.last_cli_step = max((s["step"] for s in _existing_steps), default=-1)
     del _existing_steps, _get_llm_logger
 
     while not termination_triggered.is_set():
@@ -775,6 +841,7 @@ def _run_agent_loop(
         session_metrics = CliSessionMetrics()
         log_path = os.path.join(log_dir, f"session_{iteration:03d}.jsonl")
         cli_log_file = open(log_path, "w")
+        run_state.cli_log_file = cli_log_file
         logger.info("Agent JSONL log: %s", log_path)
 
         cli_session = launch_cli_agent(
@@ -794,6 +861,7 @@ def _run_agent_loop(
             run_id=run_id,
             agent_memory_dir=str(agent_memory_dir),
         )
+        run_state.cli_session = cli_session
 
         wait_start = time.monotonic()
         last_heartbeat = 0.0
@@ -820,14 +888,18 @@ def _run_agent_loop(
                 elapsed = int(now - wait_start)
                 logger.info("Agent running (pid=%s, elapsed=%ds)", cli_session.process.pid, elapsed)
                 last_heartbeat = now
-                processed_hashes, last_cli_step = backend.log_cli_interaction(
-                    agent_memory_dir, processed_hashes, last_cli_step, server_url=server_url
+                run_state.processed_hashes, run_state.last_cli_step = backend.log_cli_interaction(
+                    agent_memory_dir,
+                    run_state.processed_hashes,
+                    run_state.last_cli_step,
+                    server_url=server_url,
                 )
 
             time.sleep(1)
 
         _cleanup_cli_session(cli_session, cli_log_file)
         cli_log_file = None
+        run_state.cli_log_file = None
 
         if session_metrics.session_id:
             last_session_id = session_metrics.session_id
@@ -843,8 +915,11 @@ def _run_agent_loop(
             session_metrics.tool_use_count,
             last_session_id or "none",
         )
-        processed_hashes, last_cli_step = backend.log_cli_interaction(
-            agent_memory_dir, processed_hashes, last_cli_step, server_url=server_url
+        run_state.processed_hashes, run_state.last_cli_step = backend.log_cli_interaction(
+            agent_memory_dir,
+            run_state.processed_hashes,
+            run_state.last_cli_step,
+            server_url=server_url,
         )
 
         returncode = cli_session.process.returncode
@@ -915,6 +990,15 @@ def main():
     parser.add_argument("--load-checkpoint", action="store_true", help="Load from checkpoint files")
     parser.add_argument("--backup-state", type=str,
                        help="Load from a backup zip file (extracts into run cache and auto-enables --load-checkpoint).")
+    parser.add_argument(
+        "--continue-metrics",
+        action="store_true",
+        help=(
+            "Continue counters, steps, and LLM history from --backup-state. "
+            "Without this flag, backup restores retain milestone/objective context "
+            "but start paper-comparison accounting at zero."
+        ),
+    )
     parser.add_argument("--termination-condition", type=str, default="gym_badge_count",
                        help="Termination condition type (default: gym_badge_count)")
     parser.add_argument("--termination-threshold", type=int, default=1,
@@ -954,17 +1038,6 @@ def main():
     os.environ["LLM_METRICS_WRITE_ENABLED"] = "false"  # server is the single writer; run_cli syncs via /sync_llm_metrics
     print(f"📝 Session ID: {llm_session_id}")
 
-    run_manager.save_metadata(
-        command_args=vars(args),
-        sys_argv=sys.argv,
-        additional_info={
-            "entry_point": "run_cli.py",
-            "backend": args.backend,
-            "termination_condition": args.termination_condition,
-            "termination_threshold": args.termination_threshold,
-        },
-    )
-
     if not preflight_cli(args):
         return 1
 
@@ -976,8 +1049,21 @@ def main():
             return 1
 
     if args.backup_state:
-        if _restore_from_backup(args.backup_state):
+        if _restore_from_backup(args.backup_state, args.continue_metrics):
             args.load_checkpoint = True
+
+    run_manager.save_metadata(
+        command_args=vars(args),
+        sys_argv=sys.argv,
+        additional_info={
+            "entry_point": "run_cli.py",
+            "backend": args.backend,
+            "termination_condition": args.termination_condition,
+            "termination_threshold": args.termination_threshold,
+            "continue_metrics": args.continue_metrics,
+        },
+        overwrite=True,
+    )
 
     services = _start_services(args, run_manager)
     if not services:
@@ -998,6 +1084,7 @@ def main():
     termination_reason: str | None = None
     cli_session: CliSession | None = None
     cli_log_file = None
+    run_state = CliRunState()
 
     def _sigterm_handler(signum, frame):
         """So timeout(1) or kill sends SIGTERM → same cleanup as Ctrl+C (stop container)."""
@@ -1007,7 +1094,7 @@ def main():
 
     try:
         termination_reason, cli_session, cli_log_file = _run_agent_loop(
-            services, args, run_manager, agent_memory_dir, backend
+            services, args, run_manager, agent_memory_dir, backend, run_state
         )
         if termination_reason == "server_died":
             return 1
@@ -1026,6 +1113,13 @@ def main():
         print("\n\n🛑 Shutdown requested by user")
         return 0
     finally:
+        _flush_cli_metrics_before_shutdown(
+            run_state,
+            backend,
+            agent_memory_dir,
+            services.server_url,
+            args.graceful_timeout,
+        )
         try: # Always backup on termination
             from utils.data_persistence.backup_manager import create_cli_agent_termination_backup
             backup_path = create_cli_agent_termination_backup(run_id, termination_reason)
@@ -1035,8 +1129,8 @@ def main():
             logger.warning("Failed to create termination backup: %s", e)
         _cleanup_services(
             services,
-            cli_session,
-            cli_log_file,
+            run_state.cli_session or cli_session,
+            run_state.cli_log_file or cli_log_file,
             args,
             graceful_timeout=args.graceful_timeout,
         )

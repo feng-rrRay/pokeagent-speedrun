@@ -158,6 +158,7 @@ test_gemini.py
 out.txt
 out_2.txt
 run.sh
+run_cli.sh
 llm_logs/*
 
 # Agent backups

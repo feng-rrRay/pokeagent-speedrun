@@ -79,6 +79,32 @@ class TestAddStepToolCalls:
             assert entry["tool_calls"][0]["name"] == "navigate_to"
 
 
+class TestAppendCliStep:
+
+    def test_preserves_source_event_id_for_resume_deduplication(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            logger = _make_logger(tmpdir)
+            logger.append_cli_step(
+                step_number=1,
+                token_usage={
+                    "prompt": 100,
+                    "completion": 10,
+                    "cached": 0,
+                    "cache_write": 0,
+                    "total": 110,
+                    "cost": 0.0,
+                },
+                duration=1.0,
+                timestamp=1000.0,
+                model_info={"model": "gemini-3.1-pro-preview"},
+                source_event_id="session-1:assistant:1",
+            )
+
+            assert logger.cumulative_metrics["steps"][0]["source_event_id"] == (
+                "session-1:assistant:1"
+            )
+
+
 class TestLogMilestoneWithActions:
 
     def test_first_milestone_cumulative_and_split(self):
