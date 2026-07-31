@@ -160,7 +160,9 @@ out_2.txt
 run.sh
 run_cli.sh
 llm_logs/*
-ace/
+# Vendored read-only ACE reference clone at the repo root.
+# Anchored: an unanchored "ace/" also hides agents/ace/ (the ACE scaffold).
+/ace/
 
 # Agent backups
 backups/

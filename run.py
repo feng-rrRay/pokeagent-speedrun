@@ -50,6 +50,18 @@ CUSTOM_AGENT_CONFIGS = {
         "use_backend": True,
         "supports_prompt_optimization": False,
     },
+    "ace": {
+        "name": "PokeAgent",
+        "details": [
+            "ACE scaffold (Agentic Context Engineering, arXiv 2510.04618)",
+            "press_buttons only + an evolving playbook curated by a reflector/curator pair",
+            "Reset-free port: 20-step pseudo-episodes, emulator-verified environment feedback",
+        ],
+        "module": "agents.PokeAgent",
+        "class": "PokeAgent",
+        "use_backend": True,
+        "supports_prompt_optimization": False,
+    },
     "continualharness": {
         "name": "PokeAgent",
         "details": [
@@ -93,6 +105,7 @@ SCAFFOLD_DESCRIPTIONS = {
     "pokeagent": "PokeAgent (VLM benchmark agent with tool scaffolding)",
     "simple": "PokeAgent-Simple (H_min: no built-in subagents, direct replan, empty registry)",
     "simplest": "PokeAgent-Simplest (bare minimum: press_buttons + process_memory only)",
+    "ace": "ACE (press_buttons + evolving playbook via reflector/curator)",
     "continualharness": "ContinualHarness (H_auto: H_min + reset-free evolutionary optimization)",
     "autonomous_cli": "PokeAgent (legacy alias)",
     "vision_only": "Vision-Only Agent (no map info, no pathfinding, button sequences)",
@@ -101,6 +114,24 @@ SCAFFOLD_DESCRIPTIONS = {
 SUPPORTED_SCAFFOLDS = list(CUSTOM_AGENT_CONFIGS.keys())
 
 SERVER_MANAGED_SCAFFOLDS = list(CUSTOM_AGENT_CONFIGS.keys())
+
+
+def build_ace_config(args):
+    """Collect the --ace-* flags into the config dict AceController expects."""
+    return {
+        "enabled": True,
+        # Keep in sync with --ace-window-steps and agents.ace.DEFAULT_ACE_CONFIG;
+        # 100 matches the ContinualHarness arm's --optimization-window-length.
+        "window_steps": getattr(args, "ace_window_steps", 100),
+        "playbook_path": getattr(args, "ace_playbook", None),
+        "budget_tokens": getattr(args, "ace_playbook_budget_tokens", 6000),
+        "min_bullets": getattr(args, "ace_playbook_min_bullets", 10),
+        "unused_grace_windows": getattr(args, "ace_unused_grace_windows", 5),
+        "curator_frequency": getattr(args, "ace_curator_frequency", 1),
+        "warmup_steps": getattr(args, "ace_warmup_steps", 0),
+        "freeze_playbook": getattr(args, "ace_freeze_playbook", False),
+        "max_steps": getattr(args, "max_steps", None),
+    }
 
 
 def start_server(args, run_id=None):
@@ -127,8 +158,8 @@ def start_server(args, run_id=None):
     # Single-writer metrics: server is the only writer
     server_env["LLM_METRICS_WRITE_ENABLED"] = "true"
 
-    # simple/simplest/continualharness scaffolds start with an empty subagent registry
-    if getattr(args, "scaffold", "pokeagent") in ("simple", "simplest", "continualharness"):
+    # simple/simplest/ace/continualharness scaffolds start with an empty subagent registry
+    if getattr(args, "scaffold", "pokeagent") in ("simple", "simplest", "ace", "continualharness"):
         server_env["EXCLUDE_BUILTIN_SUBAGENTS"] = "1"
 
     # Pass through server-relevant arguments
@@ -240,7 +271,7 @@ def start_custom_agent(agent_config, args):
     print("")
 
     # Ensure EXCLUDE_BUILTIN_SUBAGENTS is visible in the agent process too
-    if getattr(args, "scaffold", "pokeagent") in ("simple", "simplest", "continualharness"):
+    if getattr(args, "scaffold", "pokeagent") in ("simple", "simplest", "ace", "continualharness"):
         os.environ["EXCLUDE_BUILTIN_SUBAGENTS"] = "1"
 
     # Dynamic import
@@ -281,6 +312,8 @@ def start_custom_agent(agent_config, args):
         if getattr(args, "bootstrap_from", None):
             agent_kwargs["bootstrap_from"] = args.bootstrap_from
             agent_kwargs["bootstrap_prompt_path"] = getattr(args, "bootstrap_prompt_path", None)
+        if args.scaffold == "ace":
+            agent_kwargs["ace_config"] = build_ace_config(args)
 
     agent = agent_class(**agent_kwargs)
     print("✅ Agent created", flush=True)
@@ -359,6 +392,33 @@ def main():
                        help="Enable get_walkthrough tool for vision_only agent")
     parser.add_argument("--allow-slam", action="store_true",
                        help="Enable SLAM (map building) for vision_only agent")
+
+    # --- ACE scaffold (only read when --scaffold ace) ---
+    ace_group = parser.add_argument_group("ACE scaffold")
+    ace_group.add_argument("--ace-window-steps", type=int, default=100,
+                       help="Steps per ACE pseudo-episode (reflect+curate window). Default 100, "
+                            "matching the ContinualHarness comparison arm's "
+                            "--optimization-window-length and its stable evolution cadence.")
+    ace_group.add_argument("--ace-playbook", type=str, default=None,
+                       help="Path to a playbook to warm-start from (ACE offline warmup). "
+                            "Ignored if the run cache already contains a playbook.")
+    ace_group.add_argument("--ace-playbook-budget-tokens", type=int, default=6000,
+                       help="Hard token budget for the injected playbook (default 6000). "
+                            "Exceeding it triggers deterministic pruning. Pass 0 to disable "
+                            "enforcement entirely, reproducing the ACE reference implementation "
+                            "(whose 80000-token budget is advisory and never enforced in code).")
+    ace_group.add_argument("--ace-playbook-min-bullets", type=int, default=10,
+                       help="Never prune below this many bullets (default 10)")
+    ace_group.add_argument("--ace-unused-grace-windows", type=int, default=5,
+                       help="Windows a never-cited bullet is protected from pruning (default 5)")
+    ace_group.add_argument("--ace-curator-frequency", type=int, default=1,
+                       help="Run the curator every N windows (default 1, as in ACE)")
+    ace_group.add_argument("--ace-warmup-steps", type=int, default=0,
+                       help="Steps before the first ACE window fires (default 0)")
+    ace_group.add_argument("--ace-freeze-playbook", action="store_true",
+                       help="Inject the playbook but never update it -- no curation, no pruning, "
+                            "and no helpful/harmful counter updates (static-context control)")
+
     args = parser.parse_args()
 
     # Set GAME_TYPE early — MUST happen before any import from the agents

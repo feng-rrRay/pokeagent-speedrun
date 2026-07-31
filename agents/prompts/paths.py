@@ -55,10 +55,18 @@ _simplest_prompts = {
     "emerald": f"{PROMPTS_ROOT}/pokeagent-directives/SIMPLEST.md",
 }
 
+# ACE scaffold: same minimal tier as simplest, but press_buttons only (no
+# process_memory) and with the playbook usage/citation contract instead.
+_ace_prompts = {
+    "red": f"{PROMPTS_ROOT}/pokeagent-directives/ACE_RED.md",
+    "emerald": f"{PROMPTS_ROOT}/pokeagent-directives/ACE.md",
+}
+
 POKEAGENT_PROMPT_PATH = _default_system_prompts[game_type]
 POKEAGENT_SYSTEM_PROMPT_PATH = _optimization_enabled_prompts[game_type]
 SIMPLE_PROMPT_PATH = _simple_prompts[game_type]
 SIMPLEST_PROMPT_PATH = _simplest_prompts[game_type]
+ACE_PROMPT_PATH = _ace_prompts[game_type]
 
 # ---------------------------------------------------------------------------
 # Templated files: single file with {game_name}, rendered at load time

@@ -76,6 +76,7 @@ from agents.prompts.paths import (
     POKEAGENT_PROMPT_PATH,
     SIMPLE_PROMPT_PATH,
     SIMPLEST_PROMPT_PATH,
+    ACE_PROMPT_PATH,
     render_prompt,
     resolve_repo_path,
 )
@@ -85,6 +86,10 @@ from agents.prompts.paths import (
 # with only press_buttons + process_memory.
 _NO_BUILTINS_SCAFFOLDS = {"simple", "continualharness"}
 _SIMPLEST_SCAFFOLD = "simplest"
+# ACE scaffold: same bare-minimum tier as simplest, but press_buttons only,
+# plus the ACE playbook / reflector / curator (see agents/ace/).
+_ACE_SCAFFOLD = "ace"
+_MINIMAL_SCAFFOLDS = {_SIMPLEST_SCAFFOLD, _ACE_SCAFFOLD}
 from agents.tools.registry import build_tools_for_scaffold
 from utils.json_utils import convert_protobuf_value, convert_protobuf_args, normalize_replan_edits
 
@@ -191,6 +196,7 @@ class PokeAgent:
         scaffold: str = "pokeagent",
         bootstrap_from: str = None,
         bootstrap_prompt_path: str = None,
+        ace_config: Optional[dict] = None,
     ):
         logger.info(f"🚀 Initializing PokeAgent with backend={backend}, model={model}, server={server_url}, scaffold={scaffold}")
         self.server_url = server_url
@@ -203,7 +209,7 @@ class PokeAgent:
         self.optimization_enabled = enable_prompt_optimization
         self.optimization_window_length = optimization_window_length
         self.scaffold = scaffold
-        self.include_builtins = scaffold not in _NO_BUILTINS_SCAFFOLDS and scaffold != _SIMPLEST_SCAFFOLD
+        self.include_builtins = scaffold not in _NO_BUILTINS_SCAFFOLDS and scaffold not in _MINIMAL_SCAFFOLDS
 
         # Bootstrap state
         self.bootstrap_active = bootstrap_from is not None
@@ -230,6 +236,8 @@ class PokeAgent:
         if system_instructions_file is None:
             if self.scaffold == "continualharness":
                 system_instructions_file = CONTINUAL_HARNESS_SYSTEM_PROMPT_PATH
+            elif self.scaffold == _ACE_SCAFFOLD:
+                system_instructions_file = ACE_PROMPT_PATH
             elif self.scaffold == _SIMPLEST_SCAFFOLD:
                 system_instructions_file = SIMPLEST_PROMPT_PATH
             elif self.scaffold in _NO_BUILTINS_SCAFFOLDS:
@@ -307,6 +315,22 @@ class PokeAgent:
                     initial_prompt_override=self._bootstrap_prompt_content,
                 )
                 logger.info(f"🔄 Prompt optimization ENABLED (trajectory window: {optimization_window_length} steps)")
+
+        # ACE scaffold: playbook + reflector + curator (agents/ace/).
+        self.ace = None
+        if self.scaffold == _ACE_SCAFFOLD and (ace_config is None or ace_config.get("enabled", True)):
+            from agents.ace import create_ace_controller
+
+            _gt = os.environ.get("GAME_TYPE", "emerald").lower()
+            self.ace = create_ace_controller(
+                vlm=self.vlm,
+                mcp_adapter=self.mcp_adapter,
+                run_data_manager=get_run_data_manager(),
+                config=ace_config,
+                game_name="Pokemon Red" if _gt == "red" else "Pokemon Emerald",
+            )
+            self.ace.set_history_source(lambda: self.conversation_history)
+            logger.info("📘 ACE ENABLED (playbook + reflector + curator)")
 
     def _load_system_instructions(self, filename: str) -> str:
         """Load system instructions from file."""
@@ -2368,6 +2392,11 @@ class PokeAgent:
         skipped entirely (those tools are not available) to save latency
         and tokens.
         """
+        # ACE has no process_memory tool, so nothing ever writes to the memory
+        # store: skip that fetch too.
+        if self.scaffold == _ACE_SCAFFOLD:
+            return {"memory": "", "skills": "", "subagents": ""}
+
         ctx = {"memory": self._get_memory_context()}
         if self.scaffold == _SIMPLEST_SCAFFOLD:
             ctx["skills"] = ""
@@ -2655,14 +2684,16 @@ Step {step_count}"""
         if is_title_sequence:
             state_text = self._strip_map_info(state_text)
 
+        is_ace = self.scaffold == _ACE_SCAFFOLD
         is_simplest = self.scaffold == _SIMPLEST_SCAFFOLD
+        is_minimal = self.scaffold in _MINIMAL_SCAFFOLDS
 
-        # --- Objectives (skipped entirely for simplest) ---
+        # --- Objectives (skipped entirely for the minimal scaffolds) ---
         direct_objective = ""
         direct_objective_status = ""
         direct_objective_context = ""
 
-        if not is_simplest:
+        if not is_minimal:
             objectives_mode = game_state_data.get("objectives_mode", "legacy")
             logger.info(f"🎯 Objectives mode: {objectives_mode}")
 
@@ -2792,8 +2823,20 @@ Step {step_count}"""
             parts.append(self._load_bootstrap_addendum())
             bootstrap_block = "\n".join(parts) + "\n"
 
-        # --- Assemble prompt (simplest gets a minimal layout) ---
-        if is_simplest:
+        # --- Assemble prompt (the minimal scaffolds get a reduced layout) ---
+        if is_ace:
+            # ACE: playbook first (it is the slowest-changing block, and this is
+            # the closest position to the reference's system-prompt injection).
+            # No long-term memory section — ace has no process_memory tool.
+            ace_block = self.ace.get_playbook_block() if self.ace else ""
+            prompt = f"""{ace_block}{bootstrap_block}# Step: {step_count}
+### SHORT-TERM MEMORY (last {ACTION_HISTORY_WINDOW} steps)
+{action_history}
+{function_results_context}
+### STATE
+{state_text}
+"""
+        elif is_simplest:
             prompt = f"""{bootstrap_block}# Step: {step_count}
 ### SHORT-TERM MEMORY (last {ACTION_HISTORY_WINDOW} steps)
 {action_history}
@@ -3068,6 +3111,20 @@ Step {step_count}"""
                     continue
 
                 logger.info(f"✅ Global step counter now {self.step_count}")
+
+                # ACE: record the step and fire a reflect/curate window when the
+                # pseudo-episode boundary is reached. Placed here rather than in
+                # run_step so a single hook covers both the tool-call and the
+                # text-only response paths.
+                if self.ace is not None:
+                    try:
+                        self.ace.on_step_complete(
+                            step=self.step_count,
+                            response_text=output,
+                            game_state_json=game_state_result,
+                        )
+                    except Exception as e:
+                        logger.error(f"❌ ACE window update failed: {e}", exc_info=True)
 
                 # Update server metrics
                 try:

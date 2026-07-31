@@ -9,6 +9,7 @@ import pytest
 import run
 from agents.PokeAgent import PokeAgent
 from agents.prompts.paths import (
+    ACE_PROMPT_PATH,
     CONTINUAL_HARNESS_SYSTEM_PROMPT_PATH,
     POKEAGENT_PROMPT_PATH,
     SIMPLE_PROMPT_PATH,
@@ -134,6 +135,9 @@ def test_continualharness_scaffold_uses_continualharness_prompt():
 
 EXPECTED_TOOLS_PER_SCAFFOLD = {
     "simplest": {"press_buttons", "process_memory"},
+    # ACE deliberately has no process_memory: the curated playbook is its only
+    # persistent-knowledge channel, so a second one would confound the comparison.
+    "ace": {"press_buttons"},
     "simple": {
         "press_buttons", "complete_direct_objective", "process_memory",
         "process_skill", "run_skill", "run_code", "process_subagent",
@@ -165,6 +169,13 @@ def test_run_scaffold_contract_uses_continualharness_not_legacy_name():
     assert legacy_scaffold_name not in run.SUPPORTED_SCAFFOLDS
 
 
+def test_ace_scaffold_is_registered():
+    assert "ace" in run.SUPPORTED_SCAFFOLDS
+    assert "ace" in run.SCAFFOLD_DESCRIPTIONS
+    assert run.CUSTOM_AGENT_CONFIGS["ace"]["class"] == "PokeAgent"
+    assert run.CUSTOM_AGENT_CONFIGS["ace"]["supports_prompt_optimization"] is False
+
+
 @pytest.mark.parametrize("scaffold", list(EXPECTED_TOOLS_PER_SCAFFOLD.keys()))
 def test_tool_declarations_per_scaffold(scaffold):
     """Each scaffold gets exactly the expected set of tools from the registry."""
@@ -181,6 +192,7 @@ def test_tool_declarations_via_pokeagent(scaffold):
     """PokeAgent._create_tool_declarations delegates to the registry correctly."""
     load_mock = MagicMock(return_value="SYS_BODY")
     with patch.object(_POKE_MODULE, "MCPToolAdapter"), patch.object(_POKE_MODULE, "VLM"), \
+         patch("utils.agent_infrastructure.vlm_backends.VLM"), \
          patch.object(_POKE_MODULE, "get_run_data_manager") as m_rm:
         m_rm.return_value = None
         with patch.object(PokeAgent, "_load_system_instructions", load_mock):
@@ -225,6 +237,126 @@ def test_simplest_prompt_excludes_stores_and_objectives():
     assert "### LONG-TERM MEMORY OVERVIEW" in prompt
     assert "### STATE" in prompt
     assert "### SHORT-TERM MEMORY" in prompt
+
+
+def test_simplest_structured_prompt_is_byte_identical():
+    """Golden test: adding the ace scaffold must not perturb simplest by a byte.
+
+    This is the executable form of the "the H_min baseline keeps working
+    unchanged" contract. If the ace playbook block ever leaks into the shared
+    code path, this fails.
+    """
+    load_mock = MagicMock(return_value="SYS_BODY")
+    with patch.object(_POKE_MODULE, "MCPToolAdapter") as mock_mcp_cls, \
+         patch.object(_POKE_MODULE, "VLM"), \
+         patch.object(_POKE_MODULE, "get_run_data_manager") as m_rm:
+        m_rm.return_value = None
+        mock_adapter = MagicMock()
+        mock_mcp_cls.return_value = mock_adapter
+        mock_adapter.call_tool.return_value = {
+            "success": True,
+            "overview": "mem_0001 | some memory",
+        }
+        with patch.object(PokeAgent, "_load_system_instructions", load_mock):
+            agent = PokeAgent(server_url="http://localhost:8000", scaffold="simplest")
+
+    prompt = agent._build_structured_prompt(
+        json.dumps({"state_text": "Location: Littleroot Town"}), step_count=1
+    )
+
+    expected = (
+        "# Step: 1\n"
+        "### SHORT-TERM MEMORY (last 20 steps)\n"
+        "No previous actions recorded.\n"
+        "\n"
+        "### STATE\n"
+        "Location: Littleroot Town\n"
+        "### LONG-TERM MEMORY OVERVIEW\n"
+        "mem_0001 | some memory\n"
+    )
+    assert prompt == expected
+    assert "PLAYBOOK_BEGIN" not in prompt
+    assert agent.ace is None
+
+
+# ---------------------------------------------------------------------------
+# ACE scaffold
+# ---------------------------------------------------------------------------
+
+
+def _build_ace_agent(mock_adapter=None):
+    load_mock = MagicMock(return_value="SYS_BODY")
+    with patch.object(_POKE_MODULE, "MCPToolAdapter") as mock_mcp_cls, \
+         patch.object(_POKE_MODULE, "VLM"), \
+         patch("utils.agent_infrastructure.vlm_backends.VLM"), \
+         patch.object(_POKE_MODULE, "get_run_data_manager") as m_rm:
+        m_rm.return_value = None
+        adapter = mock_adapter or MagicMock()
+        mock_mcp_cls.return_value = adapter
+        adapter.call_tool.return_value = {
+            "success": True,
+            "overview": "mem_0001 | some memory",
+        }
+        with patch.object(PokeAgent, "_load_system_instructions", load_mock):
+            agent = PokeAgent(server_url="http://localhost:8000", scaffold="ace")
+    return agent, load_mock
+
+
+def test_ace_scaffold_uses_ace_prompt():
+    agent, load_mock = _build_ace_agent()
+    load_mock.assert_called_once()
+    assert _filename_arg(load_mock) == ACE_PROMPT_PATH
+    assert agent.ace is not None
+
+
+def test_ace_prompt_injects_playbook_and_drops_memory_and_objectives():
+    agent, _ = _build_ace_agent()
+
+    game_state = json.dumps({
+        "state_text": "Location: Littleroot Town",
+        "objectives_mode": "categorized",
+        "categorized_objectives": {"story": {"id": "s1", "description": "Go north"}},
+        "categorized_status": {"story": {"current_index": 0, "total": 5, "completed": 0}},
+    })
+    prompt = agent._build_structured_prompt(game_state, step_count=1)
+
+    # The playbook comes first, so it sits in the most cacheable position.
+    assert prompt.startswith("PLAYBOOK_BEGIN")
+    assert "PLAYBOOK_END" in prompt
+    assert "### STATE" in prompt
+    assert "### SHORT-TERM MEMORY" in prompt
+
+    # ace has no process_memory tool, no objectives, no stores.
+    assert "### LONG-TERM MEMORY OVERVIEW" not in prompt
+    assert "### OBJECTIVES" not in prompt
+    assert "### SKILL LIBRARY" not in prompt
+    assert "### SUBAGENT REGISTRY" not in prompt
+
+
+def test_ace_scaffold_makes_no_store_mcp_calls():
+    """With no process_memory tool there is nothing to fetch, so the per-step
+    memory/skill/subagent MCP round-trips must be skipped."""
+    adapter = MagicMock()
+    agent, _ = _build_ace_agent(mock_adapter=adapter)
+    adapter.call_tool.reset_mock()
+
+    agent._build_structured_prompt(json.dumps({"state_text": "x"}), step_count=1)
+
+    called = [c.args[0] for c in adapter.call_tool.call_args_list if c.args]
+    assert "get_memory_overview" not in called
+    assert "get_skill_overview" not in called
+    assert "get_subagent_overview" not in called
+
+
+def test_ace_system_prompt_has_no_process_memory_references():
+    """ACE_RED.md must not tell the model to use a tool it does not have."""
+    from agents.prompts.paths import resolve_repo_path
+
+    for path in ("ACE.md", "ACE_RED.md"):
+        body = (resolve_repo_path("agents/prompts/pokeagent-directives") / path).read_text()
+        assert "process_memory" not in body
+        assert "PLAYBOOK_USED" in body
+        assert "press_buttons" in body
 
 
 def test_simple_prompt_includes_all_sections():

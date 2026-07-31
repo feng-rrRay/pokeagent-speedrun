@@ -32,14 +32,19 @@ EXPERT_SCAFFOLDS = frozenset({"pokeagent", "autonomous_cli"})
 # (skills, code, subagent CRUD, custom subagents, etc.) are available.
 NO_BUILTINS_SCAFFOLDS = frozenset({"simple", "continualharness"})
 
-# Union of all scaffolds except simplest — used for tools that every scaffold
-# except the bare-minimum one should have.
-_ALL_EXCEPT_SIMPLEST = frozenset(
+# Union of all scaffolds except ace — used for tools that every scaffold except
+# the ACE ablation should have. ACE exposes press_buttons only: its playbook is
+# the sole persistent-knowledge channel, so process_memory would be a second,
+# confounding one.
+_ALL_EXCEPT_ACE = frozenset(
     {"pokeagent", "autonomous_cli", "simple", "continualharness", "simplest"}
 )
 _STANDARD_SCAFFOLDS = frozenset(
     {"pokeagent", "autonomous_cli", "simple", "continualharness"}
 )
+
+# Bare-minimum tier: no local subagent tools of any kind.
+MINIMAL_SCAFFOLDS = frozenset({"simplest", "ace"})
 
 
 def _press_buttons_description() -> str:
@@ -131,10 +136,10 @@ TOOL_REGISTRY: List[Dict[str, Any]] = [
             "required": ["reasoning"],
         },
     },
-    # -- process_memory: every scaffold --
+    # -- process_memory: every scaffold except ace --
     {
         "name": "process_memory",
-        "scaffolds": ALL_SCAFFOLDS,
+        "scaffolds": _ALL_EXCEPT_ACE,
         "description": (
             "Manage long-term memory. The LONG-TERM MEMORY OVERVIEW in your "
             "prompt shows all entry IDs. Use 'read' to get full details, "
@@ -619,8 +624,8 @@ def build_tools_for_scaffold(scaffold: str) -> List[Dict[str, Any]]:
         )
 
     # 2) Local subagent tools (builtins vs generic primitives)
-    #    simplest gets none of these at all.
-    if scaffold != "simplest":
+    #    The minimal scaffolds (simplest, ace) get none of these at all.
+    if scaffold not in MINIMAL_SCAFFOLDS:
         include_builtins = scaffold in EXPERT_SCAFFOLDS
         for spec in LOCAL_SUBAGENT_SPECS:
             if not include_builtins and spec.tool_name in BUILTIN_SUBAGENT_TOOL_NAMES:
